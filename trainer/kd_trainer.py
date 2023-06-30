@@ -12,7 +12,7 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalPrediction
 from transformers.training_args import TrainingArguments
 
-class KDTraniner(Trainer):
+class KDTrainer(Trainer):
 
     def __init__(
         self,

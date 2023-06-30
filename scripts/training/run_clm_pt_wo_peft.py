@@ -61,7 +61,7 @@ from peft import LoraConfig, TaskType, get_peft_model, PeftModel, get_peft_model
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 import sys 
 sys.path.append('../..')
-from trainer import KDTraniner
+from trainer import KDTrainer
 from distill.quant_model import HfLlamaWrapper
 
 
@@ -659,7 +659,7 @@ def main():
                                training_args.skip_module_names)
 
     # Initialize our Trainer
-    trainer = KDTraniner(
+    trainer = KDTrainer(
         tea_model=tea_model,
         model=stu_model,
         args=training_args,
