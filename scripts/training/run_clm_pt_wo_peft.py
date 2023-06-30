@@ -26,6 +26,7 @@ import numpy as np
 import math
 import os
 import sys
+import copy
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional, List, Dict, Any, Mapping
@@ -58,27 +59,10 @@ from transformers.utils.versions import require_version
 from sklearn.metrics import accuracy_score
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel, get_peft_model_state_dict
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-
-
-class SavePeftModelCallback(transformers.TrainerCallback):
-    def save_model(self, args, state, kwargs):
-        if state.best_model_checkpoint is not None:
-            checkpoint_folder = os.path.join(state.best_model_checkpoint, "pt_lora_model")
-        else:
-            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
-
-        peft_model_path = os.path.join(checkpoint_folder, "pt_lora_model")
-        kwargs["model"].save_pretrained(peft_model_path)
-        kwargs["tokenizer"].save_pretrained(peft_model_path)
-
-    def on_save(self, args, state, control, **kwargs):
-        self.save_model(args, state, kwargs)
-        return control
-
-    def on_train_end(self, args, state, control, **kwargs):
-        peft_model_path = os.path.join(args.output_dir, "pt_lora_model")
-        kwargs["model"].save_pretrained(peft_model_path)
-        kwargs["tokenizer"].save_pretrained(peft_model_path)
+import sys 
+sys.path.append('../..')
+from trainer import KDTraniner
+from distill.quant_model import HfLlamaWrapper
 
 
 def accuracy(predictions, references, normalize=True, sample_weight=None):
@@ -88,7 +72,6 @@ def accuracy(predictions, references, normalize=True, sample_weight=None):
             )
         }
 
-
 def compute_metrics(eval_preds):
     preds, labels = eval_preds
     # preds have the same shape as the labels, after the argmax(-1) has been calculated
@@ -97,14 +80,12 @@ def compute_metrics(eval_preds):
     preds = preds[:, :-1].reshape(-1)
     return accuracy(predictions=preds, references=labels)
 
-
 def preprocess_logits_for_metrics(logits, labels):
     if isinstance(logits, tuple):
         # Depending on the model and config, logits may contain extra tensors,
         # like past_key_values, but logits always come first
         logits = logits[0]
     return logits.argmax(dim=-1)
-
 
 def fault_tolerance_data_collator(features: List) -> Dict[str, Any]:
     import torch
@@ -238,6 +219,7 @@ class ModelArguments:
         },
     )
 
+
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
             raise ValueError(
@@ -313,17 +295,34 @@ class DataTrainingArguments:
         if self.streaming:
             require_version("datasets>=2.0.0", "The streaming feature requires `datasets>=2.0.0`")
 
-
 @dataclass
 class MyTrainingArguments(TrainingArguments):
-    trainable : Optional[str] = field(default="q_proj,v_proj")
-    lora_rank : Optional[int] = field(default=8)
-    lora_dropout : Optional[float] = field(default=0.1)
-    lora_alpha : Optional[float] = field(default=32.)
-    modules_to_save : Optional[str] = field(default=None)
     debug_mode : Optional[bool] = field(default=False)
-    peft_path : Optional[str] = field(default=None)
+    
+    # KD args
+    alpha_label: Optional[float] = field(default=0.)
+    alpha_logits: Optional[float] = field(default=1.)
+    temperature: Optional[float] = field(default=1.)
+    reduction: Optional[str] = field(default='batchmean')
+    
+    # Quantization args
+    w_bit: Optional[int] = field(default=4)
+    a_bit: Optional[int] = field(default=8)
+    kv_bit: Optional[int] = field(default=4)
+    ## choose only from ('per-channel', 'per-tensor')
+    w_scheme: Optional[str] = field(default='per-channel')
+    ## choose only from ('per-channel', 'per-token', 'per-tensor')
+    a_scheme: Optional[str] = field(default='per-token')
+    kv_scheme: Optional[str] = field(default='per-token')
+    ## True or False
+    w_symmetric: Optional[bool] = field(default=True)
+    a_symmetric: Optional[bool] = field(default=True)
+    kv_symmetric: Optional[bool] = field(default=True)
 
+    def default_kv_module_names():
+        return ['k_proj', 'v_proj']
+    kv_module_names: Optional[List[str]] = field(default_factory=default_kv_module_names)
+    skip_module_names: Optional[List[str]] = field(default_factory=list)
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +464,7 @@ def main():
         }
         result["labels"] = result["input_ids"].copy()
         return result
+    
     with training_args.main_process_first(desc="dataset map tokenization and grouping"):
         lm_datasets = []
         path = Path(data_args.dataset_dir)
@@ -530,8 +530,6 @@ def main():
         logger.info("training example:")
         logger.info(tokenizer.decode(eval_dataset[0]['input_ids']))
 
-
-
     if model_args.model_name_or_path:
         torch_dtype = (
             model_args.torch_dtype
@@ -553,53 +551,117 @@ def main():
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
 
-    # model_vocab_size = model.get_output_embeddings().weight.size(0)
-    # if not (
-    #    (model_vocab_size==32000 and len(tokenizer)==49953) or \
-    #    (model_vocab_size==32000 and len(tokenizer)==32000) or \
-    #    (model_vocab_size==49953 and len(tokenizer)==49953) or \
-    #    (model_vocab_size==49954 and len(tokenizer)==49954)
-    # ):
-    #     raise ValueError(
-    #         f"The combination of base model (size: {model_vocab_size}) and tokenizer (size: {len(tokenizer)}) is not a valid configuration. Please check our project wiki for further information. \n"
-    #         "Valid configurations (base model / tokenizer):\n"
-    #         "- Continue pre-training original LLaMA: 32000 / 32000 \n"
-    #         "- Pre-training Chinese LLaMA based on original LLaMA: 32000 / 49953 \n"
-    #         "- Continue pre-training Chinese LLaMA: 49953 / 49953 \n"
-    #         "- Continue pre-training Chinese Alpaca: 49954 / 49954 \n")
+    model_vocab_size = model.get_output_embeddings().weight.size(0)
+    if not (
+       (model_vocab_size==32000 and len(tokenizer)==49953) or \
+       (model_vocab_size==32000 and len(tokenizer)==32000) or \
+       (model_vocab_size==49953 and len(tokenizer)==49953) or \
+       (model_vocab_size==49954 and len(tokenizer)==49954)
+    ):
+        raise ValueError(
+            f"The combination of base model (size: {model_vocab_size}) and tokenizer (size: {len(tokenizer)}) is not a valid configuration. Please check our project wiki for further information. \n"
+            "Valid configurations (base model / tokenizer):\n"
+            "- Continue pre-training original LLaMA: 32000 / 32000 \n"
+            "- Pre-training Chinese LLaMA based on original LLaMA: 32000 / 49953 \n"
+            "- Continue pre-training Chinese LLaMA: 49953 / 49953 \n"
+            "- Continue pre-training Chinese Alpaca: 49954 / 49954 \n")
 
     model.resize_token_embeddings(len(tokenizer))
-    if training_args.peft_path is not None:
-        logger.info("Peft from pre-trained model")
-        model = PeftModel.from_pretrained(model, training_args.peft_path)
+
+    tea_model = copy.deepcopy(model)
+
+    from torch.ao.quantization.observer import MinMaxObserver, PerChannelMinMaxObserver
+    from torch.ao.quantization.fake_quantize import FakeQuantize
+    from torch.ao.quantization import QConfig
+    from distill.fake_quants import ZeroQuantAFakeQuantize
+    from distill.observers import DyanamicPerChannelMinMaxObserver
+    
+    # w fakequant setting
+    w_observer_cls = PerChannelMinMaxObserver if training_args.w_scheme == 'per-channel' else MinMaxObserver
+    if training_args.w_scheme in ['per-channel']:
+        if training_args.w_symmetric:
+            w_qscheme = torch.per_channel_symmetric
+        else:
+            w_qscheme = torch.per_channel_affine
     else:
-        logger.info("Init new peft model")
-        target_modules = training_args.trainable.split(',')
-        modules_to_save = training_args.modules_to_save
-        if modules_to_save is not None:
-            modules_to_save = modules_to_save.split(',')
-        lora_rank = training_args.lora_rank
-        lora_dropout = training_args.lora_dropout
-        lora_alpha = training_args.lora_alpha
-        logger.info(f"target_modules: {target_modules}")
-        logger.info(f"lora_rank: {lora_rank}")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            target_modules=target_modules,
-            inference_mode=False, 
-            r=lora_rank, lora_alpha=lora_alpha, 
-            lora_dropout=lora_dropout,
-            modules_to_save=modules_to_save)
-        model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
-    old_state_dict = model.state_dict
-    model.state_dict = (
-        lambda self, *_, **__: get_peft_model_state_dict(self, old_state_dict())
-    ).__get__(model, type(model))
+        if training_args.w_symmetric:
+            w_qscheme = torch.per_tensor_symmetric
+        else:
+            w_qscheme = torch.per_tensor_affine
+    w_fakequant = FakeQuantize.with_args(
+        observer=w_observer_cls,
+        dtype=torch.qint8,
+        quant_min=-2**(training_args.w_bit-1),
+        quant_max=2**(training_args.w_bit-1)-1,
+        qscheme=w_qscheme)
+    
+    # a fakequant setting
+    if training_args.a_scheme == 'per-token':
+        a_fakequant_cls = ZeroQuantAFakeQuantize
+        a_observer_cls = DyanamicPerChannelMinMaxObserver
+    elif training_args.a_scheme == 'per-channel':
+        a_fakequant_cls = FakeQuantize
+        a_observer_cls = PerChannelMinMaxObserver
+    else:
+        a_fakequant_cls = FakeQuantize
+        a_observer_cls = MinMaxObserver
+    if training_args.a_scheme in ['per-channel', 'per-token']:
+        if training_args.a_symmetric:
+            a_qscheme = torch.per_channel_symmetric
+        else:
+            a_qscheme = torch.per_channel_affine
+    else:
+        if training_args.a_symmetric:
+            a_qscheme = torch.per_tensor_symmetric
+        else:
+            a_qscheme = torch.per_tensor_affine
+    a_fakequant = a_fakequant_cls.with_args(
+        observer=a_observer_cls,
+        dtype=torch.qint8,
+        quant_min=-2**(training_args.a_bit-1),
+        quant_max=2**(training_args.a_bit-1)-1,
+        qscheme=a_qscheme)
+
+    # kv fakequant setting
+    if training_args.kv_scheme == 'per-token':
+        kv_fakequant_cls = ZeroQuantAFakeQuantize
+        kv_observer_cls = DyanamicPerChannelMinMaxObserver
+    elif training_args.kv_scheme == 'per-channel':
+        kv_fakequant_cls = FakeQuantize
+        kv_observer_cls = PerChannelMinMaxObserver
+    else:
+        kv_fakequant_cls = FakeQuantize
+        kv_observer_cls = MinMaxObserver
+    if training_args.kv_scheme in ['per-channel', 'per-token']:
+        if training_args.kv_symmetric:
+            kv_qscheme = torch.per_channel_symmetric
+        else:
+            kv_qscheme = torch.per_channel_affine
+    else:
+        if training_args.kv_symmetric:
+            kv_qscheme = torch.per_tensor_symmetric
+        else:
+            kv_qscheme = torch.per_tensor_affine
+    kv_fakequant = kv_fakequant_cls.with_args(
+        observer=kv_observer_cls,
+        dtype=torch.qint8,
+        quant_min=-2**(training_args.kv_bit-1),
+        quant_max=2**(training_args.kv_bit-1)-1,
+        qscheme=kv_qscheme)
+    
+    qconfig = QConfig(weight=w_fakequant, activation=a_fakequant)
+    kv_qconfig = QConfig(weight=w_fakequant, activation=kv_fakequant)
+    
+    stu_model = HfLlamaWrapper(model,
+                               qconfig,
+                               kv_qconfig,
+                               training_args.kv_module_names,
+                               training_args.skip_module_names)
 
     # Initialize our Trainer
-    trainer = Trainer(
-        model=model,
+    trainer = KDTraniner(
+        tea_model=tea_model,
+        model=stu_model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
@@ -610,7 +672,7 @@ def main():
         if training_args.do_eval and not is_torch_tpu_available()
         else None,
     )
-    trainer.add_callback(SavePeftModelCallback)
+
     # Training
     if training_args.do_train:
         checkpoint = None
