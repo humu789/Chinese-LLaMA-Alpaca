@@ -1,4 +1,4 @@
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from torch import nn
 from torch.utils.data import Dataset
 from transformers import Trainer
@@ -9,8 +9,17 @@ import torch
 import torch.nn.functional as F
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_callback import TrainerCallback
-from transformers.trainer_utils import EvalPrediction
 from transformers.training_args import TrainingArguments
+
+import warnings
+from transformers.utils import is_sagemaker_mp_enabled
+from transformers.trainer_utils import (
+    EvalPrediction,
+    enable_full_determinism,
+    find_executable_batch_size,
+    get_last_checkpoint,
+    set_seed,
+)
 
 class KDTrainer(Trainer):
 
@@ -80,6 +89,7 @@ class KDTrainer(Trainer):
         loss_logits = F.kl_div(input=soft_stu_probs,
                                 target=soft_tea_probs,
                                 reduction=self.args.reduction) * (self.args.temperature**2)
+        # print(f'loss_label: {loss_label}; loss_logits: {loss_logits}')
 
         loss = self.args.alpha_label * loss_label + self.args.alpha_logits * loss_logits
 

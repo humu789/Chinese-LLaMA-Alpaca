@@ -24,6 +24,7 @@ https://huggingface.co/models?filter=text-generation
 import logging
 import numpy as np
 import math
+import time
 import os
 import sys
 import copy
@@ -33,8 +34,10 @@ from typing import Optional, List, Dict, Any, Mapping
 from pathlib import Path
 import datasets
 import torch
+import torch.distributed as dist
 from datasets import load_dataset, concatenate_datasets
 
+from evaluate import load
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -57,12 +60,14 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 from sklearn.metrics import accuracy_score
-from peft import LoraConfig, TaskType, get_peft_model, PeftModel, get_peft_model_state_dict
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 import sys 
 sys.path.append('../..')
-from trainer import KDTrainer
+from trainer import KDTrainer, PerplexityEvalCallback
 from distill.quant_model import HfLlamaWrapper
+
+from utils import (DataCollatorForCausalLM, smart_tokenizer_and_embedding_resize,
+                    get_eval_dataloader_with_all_columns, DEFAULT_PAD_TOKEN, IGNORE_INDEX)
 
 
 def accuracy(predictions, references, normalize=True, sample_weight=None):
@@ -79,6 +84,7 @@ def compute_metrics(eval_preds):
     labels = labels[:, 1:].reshape(-1)
     preds = preds[:, :-1].reshape(-1)
     return accuracy(predictions=preds, references=labels)
+
 
 def preprocess_logits_for_metrics(logits, labels):
     if isinstance(logits, tuple):
@@ -297,7 +303,24 @@ class DataTrainingArguments:
 
 @dataclass
 class MyTrainingArguments(TrainingArguments):
-    debug_mode : Optional[bool] = field(default=False)
+    debug_mode: Optional[bool] = field(default=False)
+    do_ppl_test: bool = field(default=False)
+    do_mmlu_eval: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to run the MMLU evaluation."}
+    )
+    mmlu_dataset: Optional[str] = field(
+        default='mmlu-fs',
+        metadata={"help": "MMLU dataset to use: options are `mmlu-zs` for zero-shot or `mmlu-fs` for few shot."}
+    )
+    mmlu_split: Optional[str] = field(
+        default='eval',
+        metadata={"help": "The MMLU split to run on"}
+    )
+    max_mmlu_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."}
+    )
     
     # KD args
     alpha_label: Optional[float] = field(default=0.)
@@ -322,9 +345,12 @@ class MyTrainingArguments(TrainingArguments):
     def default_kv_module_names():
         return ['k_proj', 'v_proj']
     kv_module_names: Optional[List[str]] = field(default_factory=default_kv_module_names)
-    skip_module_names: Optional[List[str]] = field(default_factory=list)
+    def default_skip_module_names():
+        return ['lm_head']
+    skip_module_names: Optional[List[str]] = field(default_factory=default_skip_module_names)
 
 logger = logging.getLogger(__name__)
+
 
 
 def main():
@@ -367,6 +393,7 @@ def main():
 
     # Detecting last checkpoint.
     last_checkpoint = None
+    os.makedirs(training_args.output_dir, exist_ok=True)
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
@@ -527,7 +554,7 @@ def main():
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
         logger.info(f"Num eval_samples  {len(eval_dataset)}")
-        logger.info("training example:")
+        logger.info("eval example:")
         logger.info(tokenizer.decode(eval_dataset[0]['input_ids']))
 
     if model_args.model_name_or_path:
@@ -551,24 +578,24 @@ def main():
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
 
-    model_vocab_size = model.get_output_embeddings().weight.size(0)
-    if not (
-       (model_vocab_size==32000 and len(tokenizer)==49953) or \
-       (model_vocab_size==32000 and len(tokenizer)==32000) or \
-       (model_vocab_size==49953 and len(tokenizer)==49953) or \
-       (model_vocab_size==49954 and len(tokenizer)==49954)
-    ):
-        raise ValueError(
-            f"The combination of base model (size: {model_vocab_size}) and tokenizer (size: {len(tokenizer)}) is not a valid configuration. Please check our project wiki for further information. \n"
-            "Valid configurations (base model / tokenizer):\n"
-            "- Continue pre-training original LLaMA: 32000 / 32000 \n"
-            "- Pre-training Chinese LLaMA based on original LLaMA: 32000 / 49953 \n"
-            "- Continue pre-training Chinese LLaMA: 49953 / 49953 \n"
-            "- Continue pre-training Chinese Alpaca: 49954 / 49954 \n")
+    # model_vocab_size = model.get_output_embeddings().weight.size(0)
+    # if not (
+    #    (model_vocab_size==32000 and len(tokenizer)==49953) or \
+    #    (model_vocab_size==32000 and len(tokenizer)==32000) or \
+    #    (model_vocab_size==49953 and len(tokenizer)==49953) or \
+    #    (model_vocab_size==49954 and len(tokenizer)==49954)
+    # ):
+    #     raise ValueError(
+    #         f"The combination of base model (size: {model_vocab_size}) and tokenizer (size: {len(tokenizer)}) is not a valid configuration. Please check our project wiki for further information. \n"
+    #         "Valid configurations (base model / tokenizer):\n"
+    #         "- Continue pre-training original LLaMA: 32000 / 32000 \n"
+    #         "- Pre-training Chinese LLaMA based on original LLaMA: 32000 / 49953 \n"
+    #         "- Continue pre-training Chinese LLaMA: 49953 / 49953 \n"
+    #         "- Continue pre-training Chinese Alpaca: 49954 / 49954 \n")
 
     model.resize_token_embeddings(len(tokenizer))
 
-    tea_model = copy.deepcopy(model)
+    # tea_model = copy.deepcopy(model)
 
     from torch.ao.quantization.observer import MinMaxObserver, PerChannelMinMaxObserver
     from torch.ao.quantization.fake_quantize import FakeQuantize
@@ -657,10 +684,25 @@ def main():
                                kv_qconfig,
                                training_args.kv_module_names,
                                training_args.skip_module_names)
+    # stu_model = model
 
     # Initialize our Trainer
-    trainer = KDTrainer(
-        tea_model=tea_model,
+    # trainer = KDTrainer(
+    #     tea_model=tea_model,
+    #     model=stu_model,
+    #     args=training_args,
+    #     train_dataset=train_dataset if training_args.do_train else None,
+    #     eval_dataset=eval_dataset if training_args.do_eval else None,
+    #     tokenizer=tokenizer,
+    #     data_collator=fault_tolerance_data_collator,
+    #     compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
+    #     preprocess_logits_for_metrics=preprocess_logits_for_metrics
+    #     if training_args.do_eval and not is_torch_tpu_available()
+    #     else None,
+    # )
+
+    # Initialize our Trainer
+    trainer = Trainer(
         model=stu_model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -672,6 +714,131 @@ def main():
         if training_args.do_eval and not is_torch_tpu_available()
         else None,
     )
+
+    if training_args.do_ppl_test:
+        # test_dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        # preprocess test dataset
+        raw_dataset_test = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        tokenized_dataset_test = raw_dataset_test.map(
+            tokenize_function,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns="text",
+            desc="Running tokenizer on dataset",
+        )
+        test_dataset = tokenized_dataset_test.map(
+            group_texts,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            desc=f"Grouping texts in chunks of {block_size}",
+        )
+        test_dataloader = trainer.get_eval_dataloader(test_dataset)
+        ppl_callback = PerplexityEvalCallback(trainer, test_dataloader)
+        trainer.add_callback(ppl_callback)
+    
+    if training_args.do_mmlu_eval:
+        if training_args.mmlu_dataset == 'mmlu-zs':
+            mmlu_dataset = load_dataset("json", data_files={
+                'eval': '/home/humu/Chinese-LLaMA-Alpaca/data/mmlu/zero_shot_mmlu_test.json',
+                'test': '/home/humu/Chinese-LLaMA-Alpaca/data/mmlu/zero_shot_mmlu_test.json',
+            })
+            mmlu_dataset = mmlu_dataset.remove_columns('subject')
+        # MMLU Five-shot (Eval/Test only)
+        elif training_args.mmlu_dataset == 'mmlu' or training_args.mmlu_dataset == 'mmlu-fs':
+            mmlu_dataset = load_dataset("json", data_files={
+                'eval': '/home/humu/Chinese-LLaMA-Alpaca/data/mmlu/five_shot_mmlu_val.json',
+                'test': '/home/humu/Chinese-LLaMA-Alpaca/data/mmlu/five_shot_mmlu_test.json',
+            })
+            # mmlu_dataset = mmlu_dataset.remove_columns('subject')
+        mmlu_dataset = mmlu_dataset[training_args.mmlu_split]
+        if training_args.max_mmlu_samples is not None:
+            mmlu_dataset = mmlu_dataset.select(range(training_args.max_mmlu_samples))
+        abcd_idx = [
+            tokenizer("A", add_special_tokens=False).input_ids[0],
+            tokenizer("B", add_special_tokens=False).input_ids[0],
+            tokenizer("C", add_special_tokens=False).input_ids[0],
+            tokenizer("D", add_special_tokens=False).input_ids[0],
+        ]
+        import evaluate
+        from tqdm import tqdm
+        accuracy = evaluate.load("accuracy", experiment_id=str(time.time_ns()))
+        class MMLUEvalCallback(transformers.TrainerCallback):
+            def _do_test_mmlu(self, args, state, control, model, **kwargs):
+                ori_data_collator = trainer.data_collator
+                trainer.data_collator = DataCollatorForCausalLM(
+                    tokenizer=tokenizer,
+                    source_max_len=2048,
+                    target_max_len=256,
+                    train_on_source=False,
+                    predict_with_generate=False,
+                )
+                data_loader = get_eval_dataloader_with_all_columns(trainer, mmlu_dataset)
+                trainer.model.eval()
+                preds, refs = [], []
+                loss_mmlu = 0
+                for batch in tqdm(data_loader, total=len(data_loader)):
+                    (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
+                    # print(f'loss: {loss.shape}')
+                    # print(f'logits: {logits[0].shape}')
+                    # print(f'labels: {labels}')
+                    # There are two tokens, the output, and eos token.
+                    logits, kv_cache = logits
+                    for i, logit in enumerate(logits):
+                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                        logit_abcd = logit[label_non_zero_id-1, abcd_idx]
+                        preds.append(torch.argmax(logit_abcd).item())
+                    labels = labels[labels != IGNORE_INDEX].view(-1, 1)[:,0]
+                    refs += [abcd_idx.index(label) for label in labels.tolist()]
+                    loss_mmlu += loss
+                # Extract results by subject.
+                dist.barrier()
+                dist.all_reduce(loss_mmlu, op=dist.ReduceOp.AVG)
+                dist.barrier()
+                results = {'mmlu_loss':loss_mmlu.item()/len(data_loader)}
+                subject = mmlu_dataset['subject']
+                subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
+                for s,p,r in zip(subject, preds, refs):
+                    subjects[s]['preds'].append(p)
+                    subjects[s]['refs'].append(r)
+                subject_sum = {}
+                subject_count = {}
+                subject_scores = []
+                for subject in subjects:
+                    subject_sum = accuracy.compute(
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds'],
+                        normalize=False
+                    )['accuracy']
+                    subject_sum = torch.tensor(subject_sum, device=trainer.model.device)
+                    subject_count = torch.tensor(len(subjects[subject]['refs']), device=trainer.model.device)
+                    dist.barrier()
+                    dist.all_reduce(subject_sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(subject_count, op=dist.ReduceOp.SUM)
+                    dist.barrier()
+                    if subject_count > 0:
+                        subject_score = (subject_sum / subject_count).item()
+                        results[f'mmlu_{training_args.mmlu_split}_accuracy_{subject}'] = subject_score
+                        subject_scores.append(subject_score)
+                results[f'mmlu_{training_args.mmlu_split}_accuracy'] = np.mean(subject_scores)
+                trainer.log(results)
+                trainer.data_collator = ori_data_collator
+            def on_train_begin(self, args, state, control, model, **kwargs):
+                if tokenizer._pad_token is None:
+                    smart_tokenizer_and_embedding_resize(
+                        special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
+                        tokenizer=tokenizer,
+                        model=model,
+                    )
+                logger.info("Test MMLU before training:")
+                self._do_test_mmlu(args, state, control, model, **kwargs)
+            def on_train_end(self, args, state, control, model, **kwargs):
+                logger.info("Test MMLU after training:")
+                self._do_test_mmlu(args, state, control, model, **kwargs)
+            def on_evaluate(self, args, state, control, model, **kwargs):
+                self._do_test_mmlu(args, state, control, model, **kwargs)
+
+        trainer.add_callback(MMLUEvalCallback)
+
 
     # Training
     if training_args.do_train:
@@ -692,24 +859,6 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
-
-    # Evaluation
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-
-        metrics = trainer.evaluate()
-
-        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
-        try:
-            perplexity = math.exp(metrics["eval_loss"])
-        except OverflowError:
-            perplexity = float("inf")
-        metrics["perplexity"] = perplexity
-
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
 
 if __name__ == "__main__":
     main()
