@@ -595,7 +595,7 @@ def main():
 
     model.resize_token_embeddings(len(tokenizer))
 
-    # tea_model = copy.deepcopy(model)
+    tea_model = copy.deepcopy(model)
 
     from torch.ao.quantization.observer import MinMaxObserver, PerChannelMinMaxObserver
     from torch.ao.quantization.fake_quantize import FakeQuantize
@@ -680,29 +680,15 @@ def main():
     kv_qconfig = QConfig(weight=w_fakequant, activation=kv_fakequant)
     
     stu_model = HfLlamaWrapper(model,
-                               qconfig,
-                               kv_qconfig,
-                               training_args.kv_module_names,
-                               training_args.skip_module_names)
-    # stu_model = model
+                               qconfig=qconfig,
+                               kv_qconfig=kv_qconfig,
+                               weight_only=True,
+                               kv_module_names=training_args.kv_module_names,
+                               skip_module_names=training_args.skip_module_names)
 
     # Initialize our Trainer
-    # trainer = KDTrainer(
-    #     tea_model=tea_model,
-    #     model=stu_model,
-    #     args=training_args,
-    #     train_dataset=train_dataset if training_args.do_train else None,
-    #     eval_dataset=eval_dataset if training_args.do_eval else None,
-    #     tokenizer=tokenizer,
-    #     data_collator=fault_tolerance_data_collator,
-    #     compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
-    #     preprocess_logits_for_metrics=preprocess_logits_for_metrics
-    #     if training_args.do_eval and not is_torch_tpu_available()
-    #     else None,
-    # )
-
-    # Initialize our Trainer
-    trainer = Trainer(
+    trainer = KDTrainer(
+        tea_model=tea_model,
         model=stu_model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -716,7 +702,6 @@ def main():
     )
 
     if training_args.do_ppl_test:
-        # test_dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
         # preprocess test dataset
         raw_dataset_test = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
         tokenized_dataset_test = raw_dataset_test.map(

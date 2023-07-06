@@ -1,20 +1,20 @@
 lr=2e-5
 
-pretrained_model="/nvme/share_data/llama_ckpts/huggingface/7B" #"decapoda-research/llama-7b-hf"
-dataset_dir="/home/humu/data/llm-qat-mini"
-data_cache="/home/humu/data/llm-qat-mini_cache"
+pretrained_model="/mnt/llama_ckpts/huggingface/7B" #"decapoda-research/llama-7b-hf"
+dataset_dir="/home/humu/data/llm-qat"
+data_cache="/home/humu/data/llm-qat_cache"
 per_device_train_batch_size=1
 per_device_eval_batch_size=1
-training_steps=20
+training_steps=50000
 gradient_accumulation_steps=1
-output_dir="/nvme/humu/llm-qat/llm-qat-mini"
+output_dir="/nvme/humu/llm-ckpts/llm-qat-log_skip-lmhead_w4"
 # resume_from_checkpoint="/nvme/humu/llm-qat/llm-qat-try/checkpoint-50000"
 # --resume_from_checkpoint ${resume_from_checkpoint} \
 low_cpu_mem_usage=True
 
 deepspeed_config_file=ds_zero2_no_offload.json
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nnodes 1 --nproc_per_node 4 --master_port 10000 run_clm_pt_wo_peft.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nnodes 1 --nproc_per_node 4 --master_port 10000 run_clm_pt_wo_peft.py \
     --deepspeed ${deepspeed_config_file} \
     --model_name_or_path ${pretrained_model} \
     --tokenizer_name_or_path ${pretrained_model} \
@@ -25,7 +25,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nnodes 1 --nproc_per_node 4 --master_por
     --per_device_eval_batch_size ${per_device_eval_batch_size} \
     --do_train True \
     --do_eval True \
-    --do_mmlu_eval \
+    --do_ppl_test \
     --evaluation_strategy steps \
     --eval_steps 10 \
     --seed $RANDOM \
@@ -50,9 +50,6 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nnodes 1 --nproc_per_node 4 --master_por
     --torch_dtype float16 \
     --gradient_checkpointing \
     --ddp_find_unused_parameters False \
-    --w_bit 8 \
-    --kv_bit 8 \
-    --a_symmetric False \
-    --kv_symmetric False \
+    --w_bit 4 \
     --low_cpu_mem_usage ${low_cpu_mem_usage} \
-    # >> ./logs/llm-qat-log_skip-lmhead_a-kv-asym.txt &
+    # >> ./logs/llm-qat-log_skip-lmhead_w4.txt &

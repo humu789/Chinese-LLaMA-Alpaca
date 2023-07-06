@@ -5,14 +5,16 @@ from typing import Optional
 from .ops import QuantLinear as QLinear
 from torch.ao.quantization import (QConfig, enable_fake_quant, enable_observer,
                                    disable_fake_quant, disable_observer)
+from torch.ao.nn.qat import Linear as WQLiear
 
 
 class HfLlamaWrapper(nn.Module):
 
     def __init__(self, 
-                 reference, 
+                 reference,
                  qconfig: QConfig, 
                  kv_qconfig: QConfig,
+                 weight_only=True,
                  kv_module_names=[],
                  skip_module_names=[]):
         super().__init__()
@@ -21,12 +23,37 @@ class HfLlamaWrapper(nn.Module):
         self.kv_qconfig = kv_qconfig
         self.kv_module_names = kv_module_names
         self.skip_module_names = skip_module_names
+        
+        if weight_only:
+            self._inplace_weight_only_qlinear(self.reference, 
+                                            self.qconfig,
+                                            self.skip_module_names)
+        else:
+            self._inplace_qlinear(self.reference, 
+                                self.qconfig,
+                                self.kv_qconfig,
+                                self.kv_module_names,
+                                self.skip_module_names)
 
-        self._inplace_qlinear(self.reference, 
-                              self.qconfig,
-                              self.kv_qconfig,
-                              self.kv_module_names,
-                              self.skip_module_names)
+    def _inplace_weight_only_qlinear(self,
+                                     module,
+                                     qconfig,
+                                     skip_module_names):
+        def travase(m, qconfig, skip_module_names=[], prefix=''):
+
+            for name, child in m.named_children():
+
+                full_child_name = f'{prefix}.{name}' if len(prefix) else name
+                if isinstance(child,
+                              nn.Linear) and name not in skip_module_names:
+                    child.qconfig = qconfig
+                    qlinear = WQLiear.from_float(child)
+                    setattr(m, name, qlinear)
+                    print(f'Convert {full_child_name} to WQLiear')
+                else:
+                    travase(child, qconfig, skip_module_names, full_child_name)
+
+        travase(module, qconfig, skip_module_names)
 
     def _inplace_qlinear(self, 
                          module, 
