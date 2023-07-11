@@ -355,6 +355,9 @@ class MyTrainingArguments(TrainingArguments):
     def default_freeze_layers():
         return ['2', '31']
     freeze_layers: Optional[List[str]] = field(default_factory=default_freeze_layers)
+    def default_spec_bit2_layers():
+        return ['4']
+    freeze_layers: Optional[List[str]] = field(default_factory=default_spec_bit2_layers)
     weight_only: bool = field(default=True)
 
 logger = logging.getLogger(__name__)
@@ -711,12 +714,20 @@ def main():
         if training_args.test_fp16:
             stu_model = model
         else:
+            spec_bit2_fakequant = ZeroQuantWFakeQuantize.with_args(
+                dtype=torch.qint8,
+                quant_min=-2**(2-1),
+                quant_max=2**(2-1)-1,
+            )
+            spec_bit2_qconfig = QConfig(weight=spec_bit2_fakequant, activation=a_fakequant)
             stu_model = HfLlamaWrapper(model,
                                     qconfig=qconfig,
                                     kv_qconfig=kv_qconfig,
                                     weight_only=training_args.weight_only,
                                     kv_module_names=training_args.kv_module_names,
-                                    skip_module_names=training_args.skip_module_names)
+                                    skip_module_names=training_args.skip_module_names,
+                                    spec_bit2_layers=training_args.spec_bit2_layers,
+                                    spec_bit2_qconfig=spec_bit2_qconfig)
         # from deepspeed.compression.compress import init_compression
         # stu_model = init_compression(model, training_args.deepspeed)
 

@@ -16,13 +16,19 @@ class HfLlamaWrapper(nn.Module):
                  kv_qconfig: QConfig,
                  weight_only=True,
                  kv_module_names=[],
-                 skip_module_names=[]):
+                 skip_module_names=[],
+                 spec_bit2_layers=[],
+                 spec_bit2_qconfig=None):
         super().__init__()
         self.reference = reference
         self.qconfig = qconfig
         self.kv_qconfig = kv_qconfig
         self.kv_module_names = kv_module_names
         self.skip_module_names = skip_module_names
+        self.spec_bit2_layers = spec_bit2_layers
+        self.spec_bit2_qconfig = spec_bit2_qconfig
+        if len(spec_bit2_layers) > 0:
+            assert spec_bit2_qconfig is not None
         
         if weight_only:
             self._inplace_weight_only_qlinear(self.reference, 
@@ -48,6 +54,12 @@ class HfLlamaWrapper(nn.Module):
             for name, child in m.named_children():
 
                 full_child_name = f'{prefix}.{name}' if len(prefix) else name
+                if full_child_name.startswith('model.layers'):
+                    layer_index = name.split('.')[2]
+                    if layer_index in self.spec_bit2_layers:
+                        is_bit2 = True
+                    else:
+                        is_bit2 = False
                 if isinstance(child,
                               nn.Linear) and name not in skip_module_names:
                     if name in kv_module_names:
@@ -55,9 +67,13 @@ class HfLlamaWrapper(nn.Module):
                         qlinear = QLinear.from_float(child)
                         print(f'Convert {full_child_name} to QLiear')
                     else:
-                        child.qconfig = qconfig
+                        if is_bit2:
+                            child.qconfig = self.spec_bit2_qconfig
+                            print(f'Convert {full_child_name} to WQLiear for 2bit')
+                        else:
+                            child.qconfig = qconfig
+                            print(f'Convert {full_child_name} to WQLiear')
                         qlinear = WQLiear.from_float(child)
-                        print(f'Convert {full_child_name} to WQLiear')
                     
                     setattr(m, name, qlinear) 
                 else:
