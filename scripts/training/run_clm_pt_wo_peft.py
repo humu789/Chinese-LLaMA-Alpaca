@@ -321,7 +321,11 @@ class MyTrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "If set, only evaluates on `max_mmlu_samples` of the MMMLU dataset."}
     )
-    
+    test_fp16: bool = field(default=False)
+    test_gptq: bool = field(default=False)
+    gptq_ckpt: Optional[str] = field(default=None)
+    gptq_bits: int = field(default=4)
+
     # KD args
     alpha_label: Optional[float] = field(default=0.)
     alpha_logits: Optional[float] = field(default=1.)
@@ -332,7 +336,7 @@ class MyTrainingArguments(TrainingArguments):
     w_bit: Optional[int] = field(default=4)
     a_bit: Optional[int] = field(default=8)
     kv_bit: Optional[int] = field(default=4)
-    ## choose only from ('per-channel', 'per-tensor')
+    ## choose only from ('per-channel', 'per-tensor', 'per-group')
     w_scheme: Optional[str] = field(default='per-channel')
     ## choose only from ('per-channel', 'per-token', 'per-tensor')
     a_scheme: Optional[str] = field(default='per-token')
@@ -348,6 +352,10 @@ class MyTrainingArguments(TrainingArguments):
     def default_skip_module_names():
         return ['lm_head']
     skip_module_names: Optional[List[str]] = field(default_factory=default_skip_module_names)
+    def default_freeze_layers():
+        return ['2', '31']
+    freeze_layers: Optional[List[str]] = field(default_factory=default_freeze_layers)
+    weight_only: bool = field(default=True)
 
 logger = logging.getLogger(__name__)
 
@@ -558,21 +566,26 @@ def main():
         logger.info(tokenizer.decode(eval_dataset[0]['input_ids']))
 
     if model_args.model_name_or_path:
-        torch_dtype = (
-            model_args.torch_dtype
-            if model_args.torch_dtype in ["auto", None]
-            else getattr(torch, model_args.torch_dtype)
-        )
-        model = LlamaForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=model_args.low_cpu_mem_usage
-        )
+        if not training_args.test_gptq:
+            torch_dtype = (
+                model_args.torch_dtype
+                if model_args.torch_dtype in ["auto", None]
+                else getattr(torch, model_args.torch_dtype)
+            )
+            model = LlamaForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=model_args.low_cpu_mem_usage
+            )
+        else:
+            sys.path.append('../../GPTQ-for-LLaMa')
+            from llama_inference import load_quant
+            model = load_quant(model_args.model_name_or_path, training_args.gptq_ckpt, training_args.gptq_bits, 128, eval=False, fused_mlp=False, warmup_autotune=False)
     else:
         model = AutoModelForCausalLM.from_config(config)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
@@ -597,30 +610,43 @@ def main():
 
     tea_model = copy.deepcopy(model)
 
+    for name, param in model.named_parameters():
+        if name.startswith('model.layers'):
+            layer_index = name.split('.')[2]
+            if layer_index in training_args.freeze_layers:
+                param.requires_grad = False
+
     from torch.ao.quantization.observer import MinMaxObserver, PerChannelMinMaxObserver
     from torch.ao.quantization.fake_quantize import FakeQuantize
     from torch.ao.quantization import QConfig
-    from distill.fake_quants import ZeroQuantAFakeQuantize
+    from distill.fake_quants import ZeroQuantAFakeQuantize, ZeroQuantWFakeQuantize
     from distill.observers import DyanamicPerChannelMinMaxObserver
     
     # w fakequant setting
-    w_observer_cls = PerChannelMinMaxObserver if training_args.w_scheme == 'per-channel' else MinMaxObserver
-    if training_args.w_scheme in ['per-channel']:
-        if training_args.w_symmetric:
-            w_qscheme = torch.per_channel_symmetric
+    if training_args.w_scheme in ['per-channel', 'per-tensor']:
+        w_observer_cls = PerChannelMinMaxObserver if training_args.w_scheme == 'per-channel' else MinMaxObserver
+        if training_args.w_scheme in ['per-channel']:
+            if training_args.w_symmetric:
+                w_qscheme = torch.per_channel_symmetric
+            else:
+                w_qscheme = torch.per_channel_affine
         else:
-            w_qscheme = torch.per_channel_affine
+            if training_args.w_symmetric:
+                w_qscheme = torch.per_tensor_symmetric
+            else:
+                w_qscheme = torch.per_tensor_affine
+        w_fakequant = FakeQuantize.with_args(
+            observer=w_observer_cls,
+            dtype=torch.qint8,
+            quant_min=-2**(training_args.w_bit-1),
+            quant_max=2**(training_args.w_bit-1)-1,
+            qscheme=w_qscheme)
     else:
-        if training_args.w_symmetric:
-            w_qscheme = torch.per_tensor_symmetric
-        else:
-            w_qscheme = torch.per_tensor_affine
-    w_fakequant = FakeQuantize.with_args(
-        observer=w_observer_cls,
-        dtype=torch.qint8,
-        quant_min=-2**(training_args.w_bit-1),
-        quant_max=2**(training_args.w_bit-1)-1,
-        qscheme=w_qscheme)
+        w_fakequant = ZeroQuantWFakeQuantize.with_args(
+            dtype=torch.qint8,
+            quant_min=-2**(training_args.w_bit-1),
+            quant_max=2**(training_args.w_bit-1)-1,
+        )
     
     # a fakequant setting
     if training_args.a_scheme == 'per-token':
@@ -679,12 +705,20 @@ def main():
     qconfig = QConfig(weight=w_fakequant, activation=a_fakequant)
     kv_qconfig = QConfig(weight=w_fakequant, activation=kv_fakequant)
     
-    stu_model = HfLlamaWrapper(model,
-                               qconfig=qconfig,
-                               kv_qconfig=kv_qconfig,
-                               weight_only=True,
-                               kv_module_names=training_args.kv_module_names,
-                               skip_module_names=training_args.skip_module_names)
+    if training_args.test_gptq:
+        stu_model = model
+    else:
+        if training_args.test_fp16:
+            stu_model = model
+        else:
+            stu_model = HfLlamaWrapper(model,
+                                    qconfig=qconfig,
+                                    kv_qconfig=kv_qconfig,
+                                    weight_only=training_args.weight_only,
+                                    kv_module_names=training_args.kv_module_names,
+                                    skip_module_names=training_args.skip_module_names)
+        # from deepspeed.compression.compress import init_compression
+        # stu_model = init_compression(model, training_args.deepspeed)
 
     # Initialize our Trainer
     trainer = KDTrainer(
@@ -808,12 +842,12 @@ def main():
                 trainer.log(results)
                 trainer.data_collator = ori_data_collator
             def on_train_begin(self, args, state, control, model, **kwargs):
-                if tokenizer._pad_token is None:
-                    smart_tokenizer_and_embedding_resize(
-                        special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
-                        tokenizer=tokenizer,
-                        model=model,
-                    )
+                # if tokenizer._pad_token is None:
+                #     smart_tokenizer_and_embedding_resize(
+                #         special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
+                #         tokenizer=tokenizer,
+                #         model=model,
+                #     )
                 logger.info("Test MMLU before training:")
                 self._do_test_mmlu(args, state, control, model, **kwargs)
             def on_train_end(self, args, state, control, model, **kwargs):

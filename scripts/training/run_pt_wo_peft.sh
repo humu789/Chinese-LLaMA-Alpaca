@@ -1,20 +1,27 @@
 lr=2e-5
 
-pretrained_model="/mnt/llama_ckpts/huggingface/7B" #"decapoda-research/llama-7b-hf"
-dataset_dir="/home/humu/data/llm-qat"
-data_cache="/home/humu/data/llm-qat_cache"
+pretrained_model="/nvme/share_data/llama_ckpts/huggingface/7B" #"decapoda-research/llama-7b-hf"
+dataset_dir="/home/humu/data/llm-qat-try"
+data_cache="/home/humu/data/llm-qat-try_cache"
 per_device_train_batch_size=1
 per_device_eval_batch_size=1
 training_steps=50000
 gradient_accumulation_steps=1
-output_dir="/nvme/humu/llm-ckpts/llm-qat-log_skip-lmhead_w4"
-# resume_from_checkpoint="/nvme/humu/llm-qat/llm-qat-try/checkpoint-50000"
+output_dir="/mnt/175/humu/llm-qat/llm-qat-log_skip-lmhead_freeze-layer2-31_w4-g128-a16-kv4_lr2e-5"
+# gptq_ckpt="/home/humu/ckpts/llama7b-4bit-128g-official.pt"
+# resume_from_checkpoint="/nvme/humu/llm-qat/llm-qat-log_skip-lmhead_w4/checkpoint-50000"
 # --resume_from_checkpoint ${resume_from_checkpoint} \
+# --test_gptq \
+# --gptq_ckpt ${gptq_ckpt} \
+# --gptq_bits 2 \
+# --freeze_layers None \
+# --kv_module_names None \
+# --freeze_layers None \
 low_cpu_mem_usage=True
 
 deepspeed_config_file=ds_zero2_no_offload.json
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nnodes 1 --nproc_per_node 4 --master_port 10000 run_clm_pt_wo_peft.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 nohup torchrun --nnodes 1 --nproc_per_node 4 --master_port 10000 run_clm_pt_wo_peft.py \
     --deepspeed ${deepspeed_config_file} \
     --model_name_or_path ${pretrained_model} \
     --tokenizer_name_or_path ${pretrained_model} \
@@ -26,8 +33,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nnodes 1 --nproc_per_node 4 --master_por
     --do_train True \
     --do_eval True \
     --do_ppl_test \
+    --do_mmlu_eval \
+    --w_bit 4 \
+    --w_scheme per-token \
     --evaluation_strategy steps \
-    --eval_steps 10 \
+    --eval_steps 1000 \
     --seed $RANDOM \
     --fp16 \
     --max_steps ${training_steps} \
@@ -39,7 +49,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nnodes 1 --nproc_per_node 4 --master_por
     --logging_steps 10 \
     --save_strategy steps \
     --save_total_limit 1 \
-    --save_steps 1000 \
+    --save_steps 2000 \
     --gradient_accumulation_steps ${gradient_accumulation_steps} \
     --preprocessing_num_workers 8 \
     --block_size 512 \
@@ -50,6 +60,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nnodes 1 --nproc_per_node 4 --master_por
     --torch_dtype float16 \
     --gradient_checkpointing \
     --ddp_find_unused_parameters False \
-    --w_bit 4 \
-    --low_cpu_mem_usage ${low_cpu_mem_usage} \
-    # >> ./logs/llm-qat-log_skip-lmhead_w4.txt &
+    --low_cpu_mem_usage ${low_cpu_mem_usage} >> ./logs/llm-qat-log_skip-lmhead_freeze-layer2-31_w4-g128-a16-kv4_lr2e-5.txt &

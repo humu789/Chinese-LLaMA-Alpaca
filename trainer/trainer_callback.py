@@ -5,6 +5,7 @@ import datasets
 import numpy as np
 import torch
 from torch.nn import CrossEntropyLoss
+import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import os
@@ -18,7 +19,7 @@ class PerplexityEvalCallback(TrainerCallback):
 
     def compute_perplexity(self, model):
         model.eval()
-        ppls = []
+        ppls = 0
         loss_fct = CrossEntropyLoss(reduction="none")
         use_cache = model.config.use_cache
         model.config.use_cache = False
@@ -31,21 +32,42 @@ class PerplexityEvalCallback(TrainerCallback):
             loss_fct = torch.nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.shape[-1]), shift_labels.view(-1))        
             ppl = torch.exp(loss)
-            ppls.append(ppl.item())
+            ppls += ppl
         
         model.config.use_cache = use_cache
-
-        return {"mean_perplexity": np.mean(ppls)}
+        return ppls
+        # return {"mean_perplexity": np.mean(ppls)}
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        perplexity_score = self.compute_perplexity(model)
-        print(f"Perplexity at beginning: {perplexity_score}")
+        ppls = self.compute_perplexity(model)
+        dist.barrier()
+        dist.all_reduce(ppls, op=dist.ReduceOp.AVG)
+        dist.barrier()
+        perplexity_score = ppls.item() / len(self.data_loader)
+        if int(os.environ["RANK"]) == 0:
+            print('#'*100)
+            print(f"Perplexity at beginning: {perplexity_score}")
+            print('#'*100)
 
     def on_train_end(self, args, state, control, model=None, **kwargs):
-        perplexity_score = self.compute_perplexity(model)
-        print(f"Perplexity at end: {perplexity_score}")
+        ppls = self.compute_perplexity(model)
+        dist.barrier()
+        dist.all_reduce(ppls, op=dist.ReduceOp.AVG)
+        dist.barrier()
+        perplexity_score = ppls.item() / len(self.data_loader)
+        if int(os.environ["RANK"]) == 0:
+            print('#'*100)
+            print(f"Perplexity at end: {perplexity_score}")
+            print('#'*100)
 
     def on_evaluate(self, args, state, control, model=None, **kwargs):
-        perplexity_score = self.compute_perplexity(model)
-        print(f"Perplexity after evaluation: {perplexity_score}")
+        ppls = self.compute_perplexity(model)
+        dist.barrier()
+        dist.all_reduce(ppls, op=dist.ReduceOp.AVG)
+        dist.barrier()
+        perplexity_score = ppls.item() / len(self.data_loader)
+        if int(os.environ["RANK"]) == 0:
+            print('#'*100)
+            print(f"Perplexity after evaluation: {perplexity_score}")
+            print('#'*100)
 

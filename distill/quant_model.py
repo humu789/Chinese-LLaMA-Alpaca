@@ -27,6 +27,8 @@ class HfLlamaWrapper(nn.Module):
         if weight_only:
             self._inplace_weight_only_qlinear(self.reference, 
                                             self.qconfig,
+                                            self.kv_qconfig,
+                                            self.kv_module_names,
                                             self.skip_module_names)
         else:
             self._inplace_qlinear(self.reference, 
@@ -38,22 +40,30 @@ class HfLlamaWrapper(nn.Module):
     def _inplace_weight_only_qlinear(self,
                                      module,
                                      qconfig,
+                                     kv_qconfig,
+                                     kv_module_names,
                                      skip_module_names):
-        def travase(m, qconfig, skip_module_names=[], prefix=''):
+        def travase(m, qconfig, kv_qconfig, kv_module_names, skip_module_names=[], prefix=''):
 
             for name, child in m.named_children():
 
                 full_child_name = f'{prefix}.{name}' if len(prefix) else name
                 if isinstance(child,
                               nn.Linear) and name not in skip_module_names:
-                    child.qconfig = qconfig
-                    qlinear = WQLiear.from_float(child)
-                    setattr(m, name, qlinear)
-                    print(f'Convert {full_child_name} to WQLiear')
+                    if name in kv_module_names:
+                        child.qconfig = kv_qconfig
+                        qlinear = QLinear.from_float(child)
+                        print(f'Convert {full_child_name} to QLiear')
+                    else:
+                        child.qconfig = qconfig
+                        qlinear = WQLiear.from_float(child)
+                        print(f'Convert {full_child_name} to WQLiear')
+                    
+                    setattr(m, name, qlinear) 
                 else:
-                    travase(child, qconfig, skip_module_names, full_child_name)
+                    travase(child, qconfig, kv_qconfig, kv_module_names, skip_module_names, full_child_name)
 
-        travase(module, qconfig, skip_module_names)
+        travase(module, qconfig, kv_qconfig, kv_module_names, skip_module_names)
 
     def _inplace_qlinear(self, 
                          module, 

@@ -4,6 +4,8 @@ from torch.nn.parameter import Parameter
 from torch.ao.quantization import FakeQuantizeBase, FakeQuantize
 from torch.ao.quantization import PerChannelMinMaxObserver
 from .observers import DyanamicPerChannelMinMaxObserver
+import collections
+from functools import reduce
 
 class ZeroQuantWFakeQuantize(FakeQuantize):
 
@@ -15,18 +17,20 @@ class ZeroQuantWFakeQuantize(FakeQuantize):
                  **observer_kwargs):
         super().__init__(observer, quant_min, quant_max, **observer_kwargs)
         self.groupsize = groupsize
-        self.activation_post_process.ch_axis = 1
+        self.activation_post_process.ch_axis = 0
         self.ch_axis = self.activation_post_process.ch_axis
 
-
     def forward(self, X):
-        input_dim = 0
-        Xs = torch.chunk(X, chunks=(X.shape[input_dim] // self.groupsize), dim=input_dim)
-        Xs = list(Xs)
-        for i, x in enumerate(Xs):
-            Xs[i] = super().forward(x)
-        X = torch.cat(Xs, dim=input_dim)
-        return X 
+        outc, inc = X.shape
+        assert inc >= self.groupsize, \
+            'Input channels should be greater than or equal to group_size.'
+        assert inc % self.groupsize == 0, \
+            'Input channels should be divisible by group_size.'
+        groups = inc // self.groupsize
+        X = X.view(outc, groups, self.groupsize).view(outc * groups, self.groupsize)
+        X = super().forward(X)
+        X = X.view(outc, groups, self.groupsize).view(outc, inc)
+        return X
 
 class ZeroQuantAFakeQuantize(FakeQuantize):
 
@@ -66,17 +70,16 @@ class ZeroQuantAFakeQuantize(FakeQuantize):
             X = X.view(org_size)
 
         else:
-            import pdb;pdb.set_trace()
             X = super().forward(X)
 
         return X
 
 if __name__ == '__main__':
-    from torch.nn.functional import mse_loss
+    from torch.nn.functional import l1_loss
     bit = 4
     quant_min = 0
     quant_max = 2 ** bit - 1
-    weight = torch.randn((1024, 2048))
+    weight = torch.randn((2048, 1024))
 
     fakequant_perchannel_w = FakeQuantize(observer=PerChannelMinMaxObserver,
                                         quant_min=quant_min,
@@ -90,15 +93,15 @@ if __name__ == '__main__':
     w_fakequant = ZeroQuantWFakeQuantize(quant_min=quant_min, quant_max=quant_max)
     weight_fq = w_fakequant(weight)
     weight_fq_perchannel = fakequant_perchannel_w(weight)
-    loss_w_zq = mse_loss(weight_fq, weight)
-    loss_w_perchannel = mse_loss(weight_fq_perchannel, weight)
+    loss_w_zq = l1_loss(weight_fq, weight)
+    loss_w_perchannel = l1_loss(weight_fq_perchannel, weight)
 
     activation = torch.randn((16, 2048, 4096))
     a_fakequant = ZeroQuantAFakeQuantize(quant_min=quant_min, quant_max=quant_max)
     activation_fq_zq = a_fakequant(activation)
     activation_fq_perchannel = fakequant_perchannel_a(activation)
-    loss_a_zq = mse_loss(activation_fq_zq, activation)
-    loss_a_perchannel = mse_loss(activation_fq_perchannel, activation)
+    loss_a_zq = l1_loss(activation_fq_zq, activation)
+    loss_a_perchannel = l1_loss(activation_fq_perchannel, activation)
 
     print(f'loss_w_zq: {loss_w_zq}; loss_w_perchannel: {loss_w_perchannel}')
     print(f'loss_a_zq: {loss_a_zq}; loss_a_perchannel: {loss_a_perchannel}')
