@@ -21,7 +21,7 @@ low_cpu_mem_usage=True
 
 deepspeed_config_file=ds_zero2_no_offload.json
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 nohup torchrun --nnodes 1 --nproc_per_node 4 --master_port 10000 run_clm_pt_wo_peft.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 nohup torchrun --nnodes 1 --nproc_per_node 4 --master_port 10000 run_llm_qat.py \
     --deepspeed ${deepspeed_config_file} \
     --model_name_or_path ${pretrained_model} \
     --tokenizer_name_or_path ${pretrained_model} \

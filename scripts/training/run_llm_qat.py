@@ -85,7 +85,6 @@ def compute_metrics(eval_preds):
     preds = preds[:, :-1].reshape(-1)
     return accuracy(predictions=preds, references=labels)
 
-
 def preprocess_logits_for_metrics(logits, labels):
     if isinstance(logits, tuple):
         # Depending on the model and config, logits may contain extra tensors,
