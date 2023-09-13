@@ -16,7 +16,6 @@ output_dir="/mnt/175/humu/llm-qat/llm-qat-log_skip-lmhead_freeze-layer2-31_w4-g1
 # --gptq_bits 2 \
 # --freeze_layers None \
 # --kv_module_names None \
-# --freeze_layers None \
 low_cpu_mem_usage=True
 
 deepspeed_config_file=ds_zero2_no_offload.json

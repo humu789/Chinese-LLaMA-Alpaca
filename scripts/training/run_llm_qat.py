@@ -347,16 +347,20 @@ class MyTrainingArguments(TrainingArguments):
 
     def default_kv_module_names():
         return ['k_proj', 'v_proj']
+    # kv's module name in the model
     kv_module_names: Optional[List[str]] = field(default_factory=default_kv_module_names)
     def default_skip_module_names():
         return ['lm_head']
+    # skip replacing linear to quantlinear in specified modules. 
     skip_module_names: Optional[List[str]] = field(default_factory=default_skip_module_names)
     def default_freeze_layers():
         return ['2', '31']
+    # freeze whose layers, not to quantize them.
     freeze_layers: Optional[List[str]] = field(default_factory=default_freeze_layers)
     def default_spec_bit2_layers():
         return ['4']
-    freeze_layers: Optional[List[str]] = field(default_factory=default_spec_bit2_layers)
+    # specify whose layers to 2 bit
+    spec_bit2_layers: Optional[List[str]] = field(default_factory=default_spec_bit2_layers)
     weight_only: bool = field(default=True)
 
 logger = logging.getLogger(__name__)
@@ -381,7 +385,6 @@ def main():
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,  # if training_args.local_rank in [-1, 0] else logging.WARN,
         handlers=[logging.StreamHandler(sys.stdout)],)
-
 
     if training_args.should_log:
         # The default of training_args.log_level is passive, so we set log level at info here to have that default.
